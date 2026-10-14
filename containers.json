@@ -1,0 +1,5 @@
+{
+  "containers": [],
+  "poll_interval_seconds": 2,
+  "database": "metrics.sqlite3"
+}
