@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Metrics | Container work sessions</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Container navigation">
+      <a class="brand" href="/" aria-label="Metrics home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>FIELDNOTE<span class="brand-sub">COMPUTE OBSERVATORY</span></span>
+      </a>
+
+      <div class="sidebar-heading"><span>MONITORING</span><span id="configured-count" class="count">0</span></div>
+      <nav id="configured-list" class="container-list" aria-label="Configured containers"></nav>
+
+      <div class="sidebar-heading history-heading"><span>HISTORY</span><span id="history-count" class="count">0</span></div>
+      <nav id="archived-list" class="container-list archived-list" aria-label="Archived containers"></nav>
+
+      <div class="sidebar-footer">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span id="database-status">Reading local history</span>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumb"><span>OBSERVABILITY</span><span class="breadcrumb-slash">/</span><span id="breadcrumb-container">SELECT A CONTAINER</span></div>
+        <div class="topbar-actions">
+          <button id="alltime-button" class="back-button" type="button" hidden>← All time</button>
+          <span id="updated-at" class="updated-at">Waiting for data</span>
+          <button id="refresh-button" class="icon-button" type="button" title="Refresh metrics" aria-label="Refresh metrics"><span aria-hidden="true">↻</span></button>
+        </div>
+      </header>
+
+      <section id="empty-state" class="empty-state" hidden>
+        <div class="empty-glyph" aria-hidden="true">∿</div>
+        <p class="eyebrow">NO OBSERVATIONS YET</p>
+        <h1>Nothing in the log.</h1>
+        <p class="empty-copy">Once the monitor records a sample, containers and work sessions will appear here.</p>
+      </section>
+
+      <div id="dashboard-view" hidden>
+        <section class="page-heading">
+          <div>
+            <p id="page-kicker" class="eyebrow">CONTAINER HISTORY</p>
+            <h1 id="page-title">Container</h1>
+            <p id="page-subtitle" class="page-subtitle"></p>
+          </div>
+          <div id="live-state" class="state-pill"><span class="state-dot"></span><span>History</span></div>
+        </section>
+
+        <section id="quality-banner" class="quality-banner" hidden>
+          <span class="quality-icon" aria-hidden="true">!</span>
+          <div class="quality-copy">
+            <strong id="quality-title">Some measurements are missing</strong>
+            <span id="quality-message"></span>
+          </div>
+          <button class="help-button" type="button" aria-label="About missing data" title="Missing intervals are shown as breaks. Counter rates across a gap are averages; memory peaks during that interval cannot be recovered.">?</button>
+        </section>
+
+        <section id="summary-grid" class="summary-grid" aria-label="Summary metrics"></section>
+
+        <section id="sessions-section" class="sessions-section" hidden>
+          <div class="section-heading">
+            <div><p class="eyebrow">WORK SESSIONS</p><h2>Runs in this container</h2></div>
+            <span id="session-count-label" class="section-meta"></span>
+          </div>
+          <div id="sessions-list" class="sessions-list"></div>
+        </section>
+
+        <section class="charts-section" aria-label="Resource history charts">
+          <div class="section-heading charts-heading">
+            <div><p class="eyebrow">TIME SERIES</p><h2 id="charts-title">All observed activity</h2></div>
+            <span class="axis-note">UTC · breaks mark unobserved time</span>
+          </div>
+          <div class="charts-grid">
+            <article class="chart-panel chart-panel-large">
+              <div class="chart-heading"><div><h3>CPU utilization</h3><p>Percentage of available CPU capacity</p></div><span class="chart-unit">%</span></div>
+              <div class="chart-wrap"><canvas id="cpu-chart" aria-label="CPU utilization over time"></canvas><p class="chart-empty" hidden>No CPU samples observed</p></div>
+            </article>
+            <article class="chart-panel chart-panel-large">
+              <div class="chart-heading"><div><h3>Memory working set</h3><p>Observed usage; peaks may be missed during gaps</p></div><span class="chart-unit">BYTES</span></div>
+              <div class="chart-wrap"><canvas id="memory-chart" aria-label="Memory usage over time"></canvas><p class="chart-empty" hidden>No memory samples observed</p></div>
+            </article>
+            <article class="chart-panel">
+              <div class="chart-heading"><div><h3>Network throughput</h3><p>Receive and transmit rates</p></div><span class="chart-unit">BYTES / S</span></div>
+              <div class="chart-wrap"><canvas id="network-chart" aria-label="Network throughput over time"></canvas><p class="chart-empty" hidden>No network samples observed</p></div>
+            </article>
+            <article class="chart-panel">
+              <div class="chart-heading"><div><h3>Block I/O throughput</h3><p>Read and write rates</p></div><span class="chart-unit">BYTES / S</span></div>
+              <div class="chart-wrap"><canvas id="block-chart" aria-label="Block I/O throughput over time"></canvas><p class="chart-empty" hidden>No block I/O samples observed</p></div>
+            </article>
+          </div>
+        </section>
+        <footer class="page-footer"><span id="sample-footer">No samples</span><span>Source: Docker Engine stats</span></footer>
+      </div>
+    </main>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
