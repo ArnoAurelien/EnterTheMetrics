@@ -1,6 +1,6 @@
 # Docker Metrics Monitor
 
-This Python CLI polls Docker Engine for resource statistics for the containers listed in `containers.json`. It refreshes a terminal table and saves samples to SQLite so they can be exported for plotting.
+This Python tool polls Docker Engine for resource statistics for the containers listed in `containers.json`. The monitor refreshes a terminal table and saves samples to SQLite; the read-only dashboard presents per-container and per-session history.
 
 ## Setup
 
@@ -20,7 +20,7 @@ Edit `containers.json` and add the names or IDs of the containers to monitor:
 }
 ```
 
-The database path is resolved relative to the config file. Samples are retained indefinitely. The polling interval can also be overridden on the command line.
+The database path is resolved relative to the config file. Samples are retained indefinitely. The polling interval can also be overridden on the command line. The monitor rereads this config each poll, so removing a container stops new sampling while preserving its saved history.
 
 ## Docker Engine Access
 
@@ -48,6 +48,17 @@ Sessions are marked finished when Docker reports a stop time. If monitoring was 
 
 The SQLite database has a `sessions` table for container lifecycle metadata and a `samples` table linked by session ID. Existing sample rows are preserved during migration but remain unassigned to sessions because their original container IDs and start times were not recorded.
 
+## Dashboard
+
+Install the dependencies, then start the collector and dashboard in separate terminals:
+
+```sh
+.venv/bin/python3 monitor.py
+.venv/bin/python3 dashboard.py
+```
+
+Open `http://127.0.0.1:5000`. The dashboard reads SQLite without modifying it and refreshes active views every three seconds; live data therefore appears only while the collector is running and Docker Engine is reachable. The left navigation lists configured containers and historical containers, including those removed from config. Container views show all-time totals and work sessions; session views show that session's metrics. Time-series charts leave breaks at recorded gaps and session boundaries. A late monitoring start is marked from the Docker start time and first observation. The chart library is loaded from jsDelivr, so chart rendering requires network access.
+
 ## Export History
 
 Export all stored samples, or filter by container and time window:
@@ -57,4 +68,4 @@ Export all stored samples, or filter by container and time window:
 .venv/bin/python3 monitor.py export --container api --since-hours 24 --output api-last-day.csv
 ```
 
-Without `--output`, CSV is written to standard output. The CSV includes UTC sample, session-start, and known session-finish times; session status and startup-observation delay; interval and gap fields; raw counters; memory measurements; CPU percentage; and derived transfer rates. `sessions` records can also be queried directly from SQLite by a future dashboard; no UI is included here.
+Without `--output`, CSV is written to standard output. The CSV includes UTC sample, session-start, and known session-finish times; session status and startup-observation delay; interval and gap fields; raw counters; memory measurements; CPU percentage; and derived transfer rates.
