@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -225,6 +226,64 @@ def _session_payload(session: dict[str, Any], samples: list[dict[str, Any]], pol
     }
 
 
+def _agent_thread_payload(connection: sqlite3.Connection, thread_id: int) -> dict[str, Any] | None:
+    tables = _tables(connection)
+    if not {"agent_threads", "agent_items"}.issubset(tables):
+        return None
+    row = connection.execute("SELECT * FROM agent_threads WHERE id = ?", (thread_id,)).fetchone()
+    if row is None:
+        return None
+    thread = dict(row)
+    items = []
+    for item_row in connection.execute(
+        "SELECT * FROM agent_items WHERE thread_id = ? ORDER BY COALESCE(timestamp, 0), ordinal, id",
+        (thread_id,),
+    ):
+        item = dict(item_row)
+        try:
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+        except (KeyError, json.JSONDecodeError):
+            item["metadata"] = {}
+        items.append(item)
+    timestamps = [item["timestamp"] for item in items if item["timestamp"] is not None]
+    boundaries = []
+    sessions = []
+    if timestamps and "sessions" in tables:
+        first_at, last_at = min(timestamps), max(timestamps)
+        session_rows = connection.execute(
+            "SELECT id, started_at, finished_at, status FROM sessions WHERE container_id = ? ORDER BY started_at, id",
+            (thread["container_id"],),
+        )
+        for session_row in session_rows:
+            session = dict(session_row)
+            if session["started_at"] <= last_at and (
+                session["finished_at"] is None or session["finished_at"] >= first_at
+            ):
+                sessions.append(session)
+            if first_at <= session["started_at"] <= last_at:
+                boundaries.append(
+                    {
+                        "timestamp": session["started_at"],
+                        "kind": "work_session_started",
+                        "session_id": session["id"],
+                    }
+                )
+            finished_at = session["finished_at"]
+            if finished_at is not None and first_at <= finished_at <= last_at:
+                boundaries.append(
+                    {
+                        "timestamp": finished_at,
+                        "kind": "work_session_ended",
+                        "session_id": session["id"],
+                    }
+                )
+    thread["items"] = items
+    thread["work_sessions"] = sessions
+    thread["boundaries"] = sorted(boundaries, key=lambda marker: (marker["timestamp"], marker["session_id"]))
+    thread["correlation"] = "timestamp_overlap_only"
+    return thread
+
+
 def create_app(config_path: str | Path | None = None) -> Flask:
     app = Flask(__name__)
     config_file = Path(config_path) if config_path is not None else Path(__file__).with_name("containers.json")
@@ -344,6 +403,66 @@ def create_app(config_path: str | Path | None = None) -> Flask:
             session = dict(row)
             samples = _query_samples(connection, session["container_id"], session_id)
             return jsonify(_session_payload(session, samples, config.poll_interval_seconds))
+        finally:
+            connection.close()
+
+    @app.get("/api/containers/<path:container_key>/agents")
+    def container_agents(container_key: str):
+        try:
+            config = dashboard_config()
+        except ConfigError as error:
+            return jsonify({"error": str(error)}), 400
+        connection = _open_database(config.database_path)
+        if connection is None:
+            return jsonify({"sources": [], "threads": []})
+        try:
+            if container_key.startswith(("legacy:", "configured:")):
+                return jsonify({"sources": [], "threads": []})
+            tables = _tables(connection)
+            sources = []
+            threads = []
+            if "agent_sources" in tables:
+                for row in connection.execute(
+                    "SELECT * FROM agent_sources WHERE container_id = ? ORDER BY provider, state_path",
+                    (container_key,),
+                ):
+                    source = dict(row)
+                    try:
+                        source["evidence"] = json.loads(source.pop("evidence_json"))
+                    except (KeyError, json.JSONDecodeError):
+                        source["evidence"] = []
+                    sources.append(source)
+            if "agent_threads" in tables:
+                threads = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT agent_threads.*,
+                            (SELECT COUNT(*) FROM agent_items WHERE agent_items.thread_id = agent_threads.id) AS item_count
+                        FROM agent_threads WHERE container_id = ?
+                        ORDER BY COALESCE(updated_at, started_at) DESC, id DESC
+                        """,
+                        (container_key,),
+                    )
+                ]
+            return jsonify({"sources": sources, "threads": threads})
+        finally:
+            connection.close()
+
+    @app.get("/api/agent-threads/<int:thread_id>")
+    def agent_thread_detail(thread_id: int):
+        try:
+            config = dashboard_config()
+        except ConfigError as error:
+            return jsonify({"error": str(error)}), 400
+        connection = _open_database(config.database_path)
+        if connection is None:
+            return jsonify({"error": "Agent thread history not found."}), 404
+        try:
+            thread = _agent_thread_payload(connection, thread_id)
+            if thread is None:
+                return jsonify({"error": "Agent thread history not found."}), 404
+            return jsonify(thread)
         finally:
             connection.close()
 

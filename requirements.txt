@@ -1,3 +1,4 @@
 docker
 rich
 Flask>=3.0,<4
+zstandard>=0.22,<1

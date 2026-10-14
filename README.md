@@ -16,15 +16,18 @@ Edit `containers.json` and add the names or IDs of the containers to monitor:
 {
   "containers": ["api", "worker"],
   "poll_interval_seconds": 2,
+  "agent_history_poll_interval_seconds": 60,
   "database": "metrics.sqlite3"
 }
 ```
 
-The database path is resolved relative to the config file. Samples are retained indefinitely. The polling interval can also be overridden on the command line. The monitor rereads this config each poll, so removing a container stops new sampling while preserving its saved history.
+The database path is resolved relative to the config file. Samples and imported transcript items are retained indefinitely. The metrics polling interval can also be overridden on the command line. Agent history is scanned independently, every 60 seconds by default. The monitor rereads this config each poll, so removing a container stops new sampling while preserving its saved history.
 
 ## Docker Engine Access
 
 The Docker Python SDK uses the Docker environment variables `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH`. The current devcontainer does not mount a Docker socket, so the Engine must be made accessible separately, for example through an already-configured secure remote endpoint or a socket mounted by the environment. The monitor does not install or configure a Docker daemon. If the Engine cannot be reached, it prints a setup-oriented error and exits.
+
+When Docker Engine access is available, the monitor also performs bounded, read-only discovery of common local agent state in configured containers. It checks known Codex CLI, Claude Code, GitHub Copilot CLI, and VS Code Copilot transcript locations and reads matching JSONL files through Docker. It can use archive access for stopped containers; agent CLI commands are not run to start, resume, or alter conversations. Each scan is capped at 50 files per provider, 2 MiB per file, and 10 MiB total. A `history_partial` status indicates skipped/unreadable files; discovered history should not be assumed complete. Discovery is best-effort: nonstandard homes, host-only VS Code state, unsupported formats, and cloud-only conversations may not be visible. Docker daemon access is highly privileged, and imported conversations, tool calls, and outputs may contain sensitive data. Protect the SQLite database accordingly. Only persisted reasoning summaries and assistant-side artifacts are shown; hidden model reasoning is not recovered.
 
 ## Run
 
@@ -46,7 +49,7 @@ CPU usage, network bytes, and block I/O counters are stored as Docker reports th
 
 Sessions are marked finished when Docker reports a stop time. If monitoring was off during a restart, the previous session is marked `finished_inferred` with no fabricated finish time. If a container disappears, its last session remains identifiable by its last sample time rather than being falsely marked finished. A session that was never observed is not added to the database.
 
-The SQLite database has a `sessions` table for container lifecycle metadata and a `samples` table linked by session ID. Existing sample rows are preserved during migration but remain unassigned to sessions because their original container IDs and start times were not recorded.
+The SQLite database has `sessions` and `samples` tables for container lifecycle and resource measurements, plus separate agent source, thread, and item tables. Agent threads are not assigned to a single Docker work session. The dashboard places known Docker start/finish timestamps between transcript items as temporal correlation only; inferred or unknown finish times are not fabricated. Existing sample rows are preserved during migration but remain unassigned to sessions because their original container IDs and start times were not recorded.
 
 ## Dashboard
 

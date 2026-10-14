@@ -15,7 +15,10 @@ const state = {
   archived: [],
   selectedContainer: null,
   selectedSession: null,
+  selectedAgentThread: null,
   detail: null,
+  agentCatalog: { sources: [], threads: [] },
+  agentThread: null,
   pollInterval: 2,
 };
 
@@ -38,6 +41,17 @@ const elements = {
   sessionsSection: document.querySelector("#sessions-section"),
   sessions: document.querySelector("#sessions-list"),
   sessionCount: document.querySelector("#session-count-label"),
+  agentSection: document.querySelector("#agent-section"),
+  agentCount: document.querySelector("#agent-count-label"),
+  agentSources: document.querySelector("#agent-sources"),
+  agentThreads: document.querySelector("#agent-threads"),
+  transcriptPanel: document.querySelector("#transcript-panel"),
+  transcriptProvider: document.querySelector("#transcript-provider"),
+  transcriptTitle: document.querySelector("#transcript-title"),
+  transcriptMeta: document.querySelector("#transcript-meta"),
+  transcriptCorrelation: document.querySelector("#transcript-correlation"),
+  transcriptNotice: document.querySelector("#transcript-notice"),
+  transcriptItems: document.querySelector("#transcript-items"),
   chartsTitle: document.querySelector("#charts-title"),
   sampleFooter: document.querySelector("#sample-footer"),
   updatedAt: document.querySelector("#updated-at"),
@@ -165,6 +179,8 @@ function showEmpty() {
 async function selectContainer(container) {
   state.selectedContainer = container;
   state.selectedSession = null;
+  state.selectedAgentThread = null;
+  state.agentThread = null;
   renderContainerList(elements.configured, state.configured);
   renderContainerList(elements.archived, state.archived, true);
   await loadContainerDetail();
@@ -175,8 +191,10 @@ async function loadContainerDetail() {
   try {
     const key = encodeURIComponent(state.selectedContainer.id);
     state.detail = await getJson(`/api/containers/${key}`);
+    state.agentCatalog = await getJson(`/api/containers/${key}/agents`);
     state.selectedSession = null;
     renderOverview();
+    if (state.selectedAgentThread !== null) await loadAgentThread(state.selectedAgentThread);
   } catch (error) {
     showError(error.message);
   }
@@ -184,6 +202,9 @@ async function loadContainerDetail() {
 
 async function selectSession(sessionId) {
   state.selectedSession = sessionId;
+  state.selectedAgentThread = null;
+  state.agentThread = null;
+  renderAgentCatalog();
   try {
     state.detail = await getJson(`/api/sessions/${sessionId}`);
     renderSession();
@@ -199,6 +220,7 @@ function showError(message) {
   elements.subtitle.textContent = message;
   elements.summary.replaceChildren();
   elements.sessionsSection.hidden = true;
+  elements.agentSection.hidden = true;
   destroyCharts();
 }
 
@@ -289,6 +311,123 @@ function renderSessionList(sessions) {
   }
 }
 
+function renderAgentCatalog() {
+  const sources = state.agentCatalog?.sources || [];
+  const threads = state.agentCatalog?.threads || [];
+  elements.agentSection.hidden = sources.length === 0 && threads.length === 0;
+  if (state.selectedAgentThread === null) {
+    elements.transcriptPanel.hidden = true;
+    elements.transcriptItems.replaceChildren();
+  }
+  elements.agentCount.textContent = `${threads.length} chat${threads.length === 1 ? "" : "s"}`;
+  elements.agentSources.replaceChildren();
+  elements.agentThreads.replaceChildren();
+  for (const source of sources) {
+    const line = document.createElement("div");
+    line.className = "agent-source";
+    const name = document.createElement("strong");
+    name.textContent = source.provider;
+    const status = document.createElement("span");
+    status.className = `agent-source-status ${source.status}`;
+    status.textContent = source.status.replaceAll("_", " ");
+    const detail = document.createElement("span");
+    detail.textContent = source.detail || "";
+    line.append(name, status, detail);
+    elements.agentSources.append(line);
+  }
+  for (const thread of threads) {
+    const button = document.createElement("button");
+    button.className = "agent-thread-button";
+    button.type = "button";
+    button.setAttribute("aria-current", String(state.selectedAgentThread === thread.id));
+    const title = document.createElement("strong");
+    title.textContent = thread.title || thread.external_id;
+    const meta = document.createElement("span");
+    meta.textContent = `${thread.provider} · ${thread.item_count} items · ${formatTime(thread.updated_at || thread.started_at, { year: true })}`;
+    button.append(title, meta);
+    button.addEventListener("click", () => selectAgentThread(thread.id));
+    elements.agentThreads.append(button);
+  }
+}
+
+async function loadAgentThread(threadId) {
+  try {
+    state.agentThread = await getJson(`/api/agent-threads/${threadId}`);
+    renderAgentThread();
+  } catch (error) {
+    state.agentThread = null;
+    elements.transcriptPanel.hidden = false;
+    elements.transcriptItems.textContent = error.message;
+  }
+}
+
+async function selectAgentThread(threadId) {
+  state.selectedAgentThread = threadId;
+  renderAgentCatalog();
+  await loadAgentThread(threadId);
+}
+
+function renderAgentThread() {
+  const thread = state.agentThread;
+  if (!thread) return;
+  elements.transcriptPanel.hidden = false;
+  elements.transcriptProvider.textContent = thread.provider.toUpperCase();
+  elements.transcriptTitle.textContent = thread.title || thread.external_id;
+  elements.transcriptMeta.textContent = [
+    thread.cwd || "Working directory unknown",
+    thread.started_at ? `Started ${formatTime(thread.started_at, { year: true })}` : "Start time unknown",
+    `${thread.items.length} transcript items`,
+  ].join(" · ");
+  elements.transcriptCorrelation.textContent = "Time correlation only";
+  elements.transcriptItems.replaceChildren();
+  const entries = [
+    ...thread.items.map((item) => ({ type: "item", timestamp: item.timestamp, item })),
+    ...thread.boundaries.map((boundary) => ({ type: "boundary", timestamp: boundary.timestamp, boundary })),
+  ];
+  const priority = (entry) => entry.type === "boundary" && entry.boundary.kind === "work_session_started" ? 0 : entry.type === "item" ? 1 : 2;
+  entries.sort((left, right) => (left.timestamp ?? Infinity) - (right.timestamp ?? Infinity) || priority(left) - priority(right));
+  for (const entry of entries) {
+    if (entry.type === "boundary") {
+      const marker = document.createElement("div");
+      marker.className = `work-boundary ${entry.boundary.kind}`;
+      const label = document.createElement("span");
+      label.textContent = entry.boundary.kind === "work_session_started" ? "Docker work session started" : "Docker work session ended";
+      const time = document.createElement("time");
+      time.textContent = formatTime(entry.timestamp, { year: true });
+      marker.append(label, time);
+      elements.transcriptItems.append(marker);
+      continue;
+    }
+    const item = entry.item;
+    const collapsible = item.kind !== "message";
+    const block = document.createElement(collapsible ? "details" : "article");
+    block.className = `transcript-item ${item.kind}`;
+    if (collapsible) {
+      const summary = document.createElement("summary");
+      summary.textContent = `${item.kind.replaceAll("_", " ")} · ${item.role}`;
+      block.append(summary);
+    }
+    const heading = document.createElement("div");
+    heading.className = "transcript-item-heading";
+    const role = document.createElement("strong");
+    role.textContent = item.role;
+    const time = document.createElement("time");
+    time.textContent = formatTime(item.timestamp, { year: true });
+    heading.append(role, time);
+    const body = document.createElement("pre");
+    body.className = "transcript-item-content";
+    body.textContent = item.content || (Object.keys(item.metadata || {}).length ? JSON.stringify(item.metadata, null, 2) : "No stored content");
+    block.append(heading, body);
+    elements.transcriptItems.append(block);
+  }
+  const uncertain = thread.work_sessions.some((session) => session.status === "finished_inferred" && session.finished_at === null);
+  const hasBoundaries = thread.boundaries.length > 0;
+  elements.transcriptNotice.hidden = !uncertain && !hasBoundaries;
+  elements.transcriptNotice.textContent = uncertain
+    ? "At least one Docker work-session end was inferred; its exact boundary is unknown. Other markers show known timestamps only."
+    : "Docker session markers are correlated by timestamp and do not prove which work produced a prompt or response.";
+}
+
 function renderOverview() {
   const detail = state.detail;
   const container = detail.container;
@@ -307,6 +446,7 @@ function renderOverview() {
   renderState(active ? active.status_display : container.configured && !container.container_id ? "waiting" : "history", active?.last_seen_at || container.last_seen_at);
   renderSummary(detail.totals, "all sessions");
   renderSessionList(detail.sessions);
+  renderAgentCatalog();
   elements.chartsTitle.textContent = detail.legacy ? "Legacy observations" : "All observed activity";
   renderQuality(detail.samples, detail.sessions, detail.legacy);
   renderCharts(detail.samples);
@@ -326,6 +466,7 @@ function renderSession() {
   renderState(session.status_display, session.last_seen_at);
   renderSummary(session.totals, "this session");
   elements.sessionsSection.hidden = true;
+  renderAgentCatalog();
   elements.chartsTitle.textContent = "Session activity";
   renderQuality(session.samples, [session]);
   renderCharts(session.samples);
@@ -434,7 +575,8 @@ async function refreshSelected() {
     ["running", "stale"].includes(state.detail?.status_display)
   );
   if (!needsLiveRefresh) return;
-  if (state.selectedSession !== null) await selectSession(state.selectedSession);
+  if (state.selectedAgentThread !== null) await loadAgentThread(state.selectedAgentThread);
+  else if (state.selectedSession !== null) await selectSession(state.selectedSession);
   else await loadContainerDetail();
 }
 

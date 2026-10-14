@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from rich.console import Console
 
+from agent_history import AgentScan, AgentSource, AgentTranscript, TranscriptItem
 from monitor import (
     ConfigError,
     EngineConnectionError,
@@ -36,7 +37,19 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.containers, ("api", "worker"))
             self.assertEqual(config.poll_interval_seconds, 2)
+            self.assertEqual(config.agent_history_poll_interval_seconds, 60)
             self.assertEqual(config.database_path, Path(temporary_directory) / "data/metrics.db")
+
+    def test_rejects_invalid_agent_history_poll_interval(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "containers.json"
+            config_path.write_text(
+                json.dumps({"containers": ["api"], "agent_history_poll_interval_seconds": 0}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "agent_history_poll_interval_seconds"):
+                load_config(config_path)
 
     def test_rejects_empty_container_list(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -141,6 +154,46 @@ class StatsTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_agent_scan_persistence_is_idempotent_and_separate_from_work_sessions(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "metrics.sqlite3"
+            transcript = AgentTranscript(
+                provider="codex",
+                thread_id="thread-1",
+                title="Fix tests",
+                source_path="/root/.codex/sessions/thread-1.jsonl",
+                cwd="/repo",
+                started_at=100,
+                updated_at=110,
+                items=(TranscriptItem("line-1", 100, "user", "message", "Fix tests"),),
+            )
+            scan = AgentScan(
+                sources=(AgentSource("codex", "history_found", ("state:/root/.codex/sessions",)),),
+                transcripts=(transcript,),
+            )
+            with SQLiteStore(database) as store:
+                session_id = store.begin_session("container-123", "api", 90, 100, 2)
+                store.save_agent_scan(
+                    "container-123",
+                    "api",
+                    AgentScan(sources=(AgentSource("codex", "not_detected"),), transcripts=()),
+                    scanned_at=110,
+                )
+                store.save_agent_scan("container-123", "api", scan, scanned_at=120)
+                store.save_agent_scan("container-123", "api", scan, scanned_at=130)
+                sources = store.list_agent_sources("container-123")
+                threads = store.list_agent_threads("container-123")
+                loaded = store.get_agent_thread(threads[0]["id"])
+                sessions = store.list_sessions("container-123")
+
+        codex_sources = [source for source in sources if source["provider"] == "codex"]
+        self.assertEqual(len(codex_sources), 1)
+        self.assertEqual(codex_sources[0]["status"], "history_found")
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["item_count"], 1)
+        self.assertEqual(loaded["items"][0]["content"], "Fix tests")
+        self.assertEqual(sessions[0]["id"], session_id)
+
     def test_persists_derived_metrics_and_exports_csv(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = Path(temporary_directory) / "metrics.sqlite3"

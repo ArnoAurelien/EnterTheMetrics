@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, TextIO
 
+from agent_history import AgentScan, scan_container
+
 
 class ConfigError(ValueError):
     pass
@@ -25,6 +27,7 @@ class EngineConnectionError(RuntimeError):
 class MonitorConfig:
     containers: tuple[str, ...]
     poll_interval_seconds: float
+    agent_history_poll_interval_seconds: float
     database_path: Path
     config_path: Path
 
@@ -105,6 +108,13 @@ def load_config(path: str | Path, require_containers: bool = True) -> MonitorCon
     if not math.isfinite(interval) or interval <= 0:
         raise ConfigError("'poll_interval_seconds' must be a positive finite number.")
 
+    agent_history_interval = data.get("agent_history_poll_interval_seconds", 60)
+    if isinstance(agent_history_interval, bool) or not isinstance(agent_history_interval, (int, float)):
+        raise ConfigError("'agent_history_poll_interval_seconds' must be a positive number.")
+    agent_history_interval = float(agent_history_interval)
+    if not math.isfinite(agent_history_interval) or agent_history_interval <= 0:
+        raise ConfigError("'agent_history_poll_interval_seconds' must be a positive finite number.")
+
     database = data.get("database", "metrics.sqlite3")
     if not isinstance(database, str) or not database.strip():
         raise ConfigError("'database' must be a non-empty file path.")
@@ -112,7 +122,7 @@ def load_config(path: str | Path, require_containers: bool = True) -> MonitorCon
     if not database_path.is_absolute():
         database_path = config_path.parent / database_path
 
-    return MonitorConfig(normalized_containers, interval, database_path.resolve(), config_path)
+    return MonitorConfig(normalized_containers, interval, agent_history_interval, database_path.resolve(), config_path)
 
 
 def _integer(value: Any) -> int | None:
@@ -323,6 +333,56 @@ class SQLiteStore:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_sources (
+                id INTEGER PRIMARY KEY,
+                container_id TEXT NOT NULL,
+                container TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                state_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                last_scanned_at REAL NOT NULL,
+                UNIQUE(container_id, provider, state_path)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_threads (
+                id INTEGER PRIMARY KEY,
+                container_id TEXT NOT NULL,
+                container TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                cwd TEXT,
+                source_path TEXT NOT NULL,
+                started_at REAL,
+                updated_at REAL,
+                last_seen_at REAL NOT NULL,
+                UNIQUE(container_id, provider, external_id)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_items (
+                id INTEGER PRIMARY KEY,
+                thread_id INTEGER NOT NULL REFERENCES agent_threads(id) ON DELETE CASCADE,
+                external_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                timestamp REAL,
+                role TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(thread_id, external_id)
+            )
+            """
+        )
         self._migrate_samples()
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS samples_container_timestamp ON samples(container, timestamp)"
@@ -332,6 +392,12 @@ class SQLiteStore:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS sessions_container_started ON sessions(container_id, started_at)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS agent_threads_container_updated ON agent_threads(container_id, updated_at DESC)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS agent_items_thread_timestamp ON agent_items(thread_id, timestamp, ordinal)"
         )
         self.connection.commit()
 
@@ -429,6 +495,153 @@ class SQLiteStore:
     def get_session(self, session_id: int) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    def save_agent_scan(
+        self,
+        container_id: str,
+        container: str,
+        scan: AgentScan,
+        scanned_at: float | None = None,
+    ) -> None:
+        scanned_at = time.time() if scanned_at is None else scanned_at
+        self.connection.execute(
+            """
+            UPDATE agent_sources SET status = 'not_detected',
+                detail = 'Not detected in latest scan', last_scanned_at = ?
+            WHERE container_id = ?
+            """,
+            (scanned_at, container_id),
+        )
+        for source in scan.sources:
+            state_path = ""
+            self.connection.execute(
+                """
+                INSERT INTO agent_sources (
+                    container_id, container, provider, state_path, status,
+                    evidence_json, detail, last_scanned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(container_id, provider, state_path) DO UPDATE SET
+                    container = excluded.container,
+                    status = excluded.status,
+                    evidence_json = excluded.evidence_json,
+                    detail = excluded.detail,
+                    last_scanned_at = excluded.last_scanned_at
+                """,
+                (
+                    container_id,
+                    container,
+                    source.provider,
+                    state_path,
+                    source.status,
+                    json.dumps(source.evidence, ensure_ascii=True),
+                    source.detail,
+                    scanned_at,
+                ),
+            )
+        for transcript in scan.transcripts:
+            self.connection.execute(
+                """
+                INSERT INTO agent_threads (
+                    container_id, container, provider, external_id, title, cwd,
+                    source_path, started_at, updated_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(container_id, provider, external_id) DO UPDATE SET
+                    container = excluded.container,
+                    title = excluded.title,
+                    cwd = excluded.cwd,
+                    source_path = excluded.source_path,
+                    started_at = COALESCE(agent_threads.started_at, excluded.started_at),
+                    updated_at = CASE
+                        WHEN excluded.updated_at IS NULL THEN agent_threads.updated_at
+                        WHEN agent_threads.updated_at IS NULL OR excluded.updated_at > agent_threads.updated_at
+                            THEN excluded.updated_at
+                        ELSE agent_threads.updated_at
+                    END,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    container_id,
+                    container,
+                    transcript.provider,
+                    transcript.thread_id,
+                    transcript.title,
+                    transcript.cwd,
+                    transcript.source_path,
+                    transcript.started_at,
+                    transcript.updated_at,
+                    scanned_at,
+                ),
+            )
+            thread = self.connection.execute(
+                "SELECT id FROM agent_threads WHERE container_id = ? AND provider = ? AND external_id = ?",
+                (container_id, transcript.provider, transcript.thread_id),
+            ).fetchone()
+            if thread is None:
+                continue
+            for ordinal, item in enumerate(transcript.items):
+                self.connection.execute(
+                    """
+                    INSERT INTO agent_items (
+                        thread_id, external_id, ordinal, timestamp, role, kind, content, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(thread_id, external_id) DO UPDATE SET
+                        ordinal = excluded.ordinal,
+                        timestamp = excluded.timestamp,
+                        role = excluded.role,
+                        kind = excluded.kind,
+                        content = excluded.content,
+                        metadata_json = excluded.metadata_json
+                    """,
+                    (
+                        thread["id"],
+                        item.external_id,
+                        ordinal,
+                        item.timestamp,
+                        item.role,
+                        item.kind,
+                        item.content,
+                        json.dumps(item.metadata, ensure_ascii=True),
+                    ),
+                )
+        self.connection.commit()
+
+    def list_agent_sources(self, container_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM agent_sources WHERE container_id = ? ORDER BY provider, state_path",
+            (container_id,),
+        )
+        result = []
+        for row in rows:
+            source = dict(row)
+            source["evidence"] = json.loads(source.pop("evidence_json"))
+            result.append(source)
+        return result
+
+    def list_agent_threads(self, container_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT agent_threads.*,
+                (SELECT COUNT(*) FROM agent_items WHERE agent_items.thread_id = agent_threads.id) AS item_count
+            FROM agent_threads WHERE container_id = ?
+            ORDER BY COALESCE(updated_at, started_at) DESC, id DESC
+            """,
+            (container_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def get_agent_thread(self, thread_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM agent_threads WHERE id = ?", (thread_id,)).fetchone()
+        if row is None:
+            return None
+        thread = dict(row)
+        thread["items"] = [
+            {**dict(item), "metadata": json.loads(item["metadata_json"])}
+            for item in self.connection.execute(
+                "SELECT * FROM agent_items WHERE thread_id = ? ORDER BY COALESCE(timestamp, 0), ordinal, id",
+                (thread_id,),
+            )
+        ]
+        return thread
 
     def save(
         self,
@@ -687,6 +900,9 @@ def run_monitor(config: MonitorConfig, interval: float | None = None) -> None:
         with Live(_render_table([]), console=console, refresh_per_second=4) as live:
             store = SQLiteStore(config.database_path)
             active_database_path = config.database_path
+            agent_scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-history")
+            agent_scan_futures: dict[str, tuple[str, Future[AgentScan]]] = {}
+            next_agent_scan: dict[str, float] = {}
             try:
                 while True:
                     poll_started = time.monotonic()
@@ -703,6 +919,19 @@ def run_monitor(config: MonitorConfig, interval: float | None = None) -> None:
                             store = SQLiteStore(current_config.database_path)
                             active_database_path = current_config.database_path
                         rows = []
+                    for scanned_container_id, (scanned_name, future) in list(agent_scan_futures.items()):
+                        if not future.done():
+                            continue
+                        try:
+                            store.save_agent_scan(
+                                scanned_container_id,
+                                scanned_name,
+                                future.result(),
+                                scanned_at=time.time(),
+                            )
+                        except Exception:
+                            pass
+                        del agent_scan_futures[scanned_container_id]
                     for name in current_config.containers if current_config is not None else ():
                         try:
                             container = client.containers.get(name)
@@ -715,6 +944,18 @@ def run_monitor(config: MonitorConfig, interval: float | None = None) -> None:
                             started_at = parse_docker_timestamp(started_at_text)
                             if not container_id or started_at is None:
                                 raise ValueError("Docker did not provide a valid container ID and StartedAt timestamp.")
+                            scan_now = time.monotonic()
+                            if (
+                                container_id not in agent_scan_futures
+                                and scan_now >= next_agent_scan.get(container_id, 0)
+                            ):
+                                agent_scan_futures[container_id] = (
+                                    name,
+                                    agent_scan_executor.submit(scan_container, container),
+                                )
+                                next_agent_scan[container_id] = (
+                                    scan_now + current_config.agent_history_poll_interval_seconds
+                                )
                             if status != "running":
                                 store.finish_container_session(
                                     container_id,
@@ -763,6 +1004,7 @@ def run_monitor(config: MonitorConfig, interval: float | None = None) -> None:
                         time.sleep(delay)
             finally:
                 store.close()
+                agent_scan_executor.shutdown(wait=False, cancel_futures=True)
     finally:
         client.close()
 

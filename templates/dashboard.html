@@ -76,6 +76,23 @@
           <div id="sessions-list" class="sessions-list"></div>
         </section>
 
+        <section id="agent-section" class="agent-section" hidden>
+          <div class="section-heading">
+            <div><p class="eyebrow">AGENT HISTORY</p><h2>Detected agents and chats</h2></div>
+            <span id="agent-count-label" class="section-meta"></span>
+          </div>
+          <div id="agent-sources" class="agent-sources" aria-live="polite"></div>
+          <div id="agent-threads" class="agent-threads" aria-label="Agent chat histories"></div>
+          <section id="transcript-panel" class="transcript-panel" hidden aria-label="Agent transcript">
+            <div class="section-heading transcript-heading">
+              <div><p id="transcript-provider" class="eyebrow"></p><h3 id="transcript-title"></h3><p id="transcript-meta" class="page-subtitle"></p></div>
+              <span id="transcript-correlation" class="section-meta"></span>
+            </div>
+            <div id="transcript-notice" class="transcript-notice" hidden></div>
+            <div id="transcript-items" class="transcript-items"></div>
+          </section>
+        </section>
+
         <section class="charts-section" aria-label="Resource history charts">
           <div class="section-heading charts-heading">
             <div><p class="eyebrow">TIME SERIES</p><h2 id="charts-title">All observed activity</h2></div>

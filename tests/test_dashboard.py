@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent_history import AgentScan, AgentSource, AgentTranscript, TranscriptItem
 from dashboard import create_app
 from monitor import MetricsSample, SQLiteStore
 
@@ -111,6 +112,47 @@ class DashboardTests(unittest.TestCase):
             {item["container_id"] for item in catalog["archived"]},
             {"container-123", "old-container"},
         )
+
+    def test_agent_thread_api_marks_known_work_session_boundaries_between_items(self):
+        with SQLiteStore(self.database_path) as store:
+            first_session = store.begin_session("container-123", "api", 101, 102, 2)
+            store.finish_session(first_session, 105)
+            second_session = store.begin_session("container-123", "api", 107, 108, 2)
+            store.finish_session(second_session, 109)
+            store.save_agent_scan(
+                "container-123",
+                "api",
+                AgentScan(
+                    sources=(AgentSource("codex", "history_found", ("state:/root/.codex/sessions",)),),
+                    transcripts=(
+                        AgentTranscript(
+                            provider="codex",
+                            thread_id="thread-1",
+                            title="Work across restarts",
+                            source_path="/root/.codex/sessions/thread-1.jsonl",
+                            cwd="/repo",
+                            started_at=100,
+                            updated_at=110,
+                            items=(
+                                TranscriptItem("u1", 100, "user", "message", "First prompt"),
+                                TranscriptItem("a1", 110, "assistant", "message", "Second answer"),
+                            ),
+                        ),
+                    ),
+                ),
+                scanned_at=120,
+            )
+
+        listing = self.client.get("/api/containers/container-123/agents").get_json()
+        detail = self.client.get(f"/api/agent-threads/{listing['threads'][0]['id']}").get_json()
+
+        self.assertEqual(listing["sources"][0]["provider"], "codex")
+        self.assertEqual(len(detail["items"]), 2)
+        self.assertEqual(
+            [marker["kind"] for marker in detail["boundaries"]],
+            ["work_session_started", "work_session_ended", "work_session_started", "work_session_ended"],
+        )
+        self.assertEqual(detail["correlation"], "timestamp_overlap_only")
 
 
 if __name__ == "__main__":
