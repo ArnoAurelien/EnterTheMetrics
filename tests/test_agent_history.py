@@ -90,6 +90,61 @@ class TranscriptParserTests(unittest.TestCase):
         self.assertEqual([item.kind for item in transcript.items], ["message", "message", "reasoning_summary"])
         self.assertEqual(transcript.items[0].timestamp, 1767225600)
 
+    def test_parses_vscode_copilot_transcript_events_without_raw_reasoning(self):
+        records = [
+            {
+                "id": "session-start-event",
+                "type": "session.start",
+                "timestamp": "2026-10-14T15:11:35.637Z",
+                "data": {"sessionId": "copilot-session-1", "producer": "copilot-agent"},
+            },
+            {
+                "id": "user-event",
+                "type": "user.message",
+                "timestamp": "2026-10-14T15:11:41.243Z",
+                "data": {"content": "Synthetic prompt"},
+            },
+            {
+                "id": "assistant-event",
+                "type": "assistant.message",
+                "timestamp": "2026-10-14T15:11:50.000Z",
+                "data": {
+                    "messageId": "message-1",
+                    "content": "Synthetic reply",
+                    "reasoningText": "private internal reasoning",
+                    "reasoningSummary": "Short explicit summary",
+                    "toolRequests": [{"toolName": "shell", "toolCallId": "tool-1", "arguments": {"command": "pytest"}}],
+                },
+            },
+            {
+                "id": "tool-start-event",
+                "type": "tool.execution_start",
+                "timestamp": "2026-10-14T15:11:51.000Z",
+                "data": {"toolName": "shell", "toolCallId": "tool-1", "arguments": {"command": "pytest"}},
+            },
+            {
+                "id": "tool-complete-event",
+                "type": "tool.execution_complete",
+                "timestamp": "2026-10-14T15:11:52.000Z",
+                "data": {"toolCallId": "tool-1", "success": True},
+            },
+        ]
+
+        transcript = parse_transcript(
+            "vscode-copilot",
+            "/home/vscode/.vscode-server/data/User/workspaceStorage/workspace/GitHub.copilot-chat/transcripts/copilot-session-1.jsonl",
+            "\n".join(map(json.dumps, records)),
+        )
+
+        self.assertEqual(transcript.thread_id, "copilot-session-1")
+        self.assertEqual(transcript.title, "Synthetic prompt")
+        self.assertEqual(
+            [item.kind for item in transcript.items],
+            ["message", "message", "reasoning_summary", "tool_call", "tool_activity", "tool_result"],
+        )
+        self.assertNotIn("private internal reasoning", json.dumps([item.__dict__ for item in transcript.items]))
+        self.assertEqual(transcript.items[-1].metadata["success"], True)
+
     def test_unknown_provider_and_empty_file_are_ignored(self):
         self.assertIsNone(parse_transcript("unknown", "thread.jsonl", "{}"))
         self.assertIsNone(parse_transcript("codex", "thread.jsonl", ""))

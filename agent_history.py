@@ -432,7 +432,7 @@ def _text(value: Any) -> str:
 
 def _artifact_metadata(value: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
-    for key in ("name", "command", "cwd", "status", "tool", "arguments", "input", "exitCode"):
+    for key in ("name", "command", "cwd", "status", "tool", "toolName", "toolCallId", "arguments", "input", "exitCode", "success"):
         item = value.get(key)
         if isinstance(item, (str, int, float, bool, list, dict)):
             metadata[key] = item
@@ -554,13 +554,59 @@ def _generic_record(record: dict[str, Any], line_number: int, items: list[Transc
         _add_item(items, record=record, line_number=line_number, role="assistant", kind="tool_call", content="", metadata=_artifact_metadata(tool))
 
 
+def _vscode_copilot_record(
+    record: dict[str, Any],
+    line_number: int,
+    items: list[TranscriptItem],
+) -> tuple[str | None, str | None]:
+    event_type = record.get("type")
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return None, None
+    if event_type == "session.start":
+        session_id = _first(data, "sessionId", "session_id")
+        cwd = _first(data, "cwd", "workingDirectory", "working_directory")
+        return (str(session_id) if session_id is not None else None, str(cwd) if isinstance(cwd, str) else None)
+    if event_type == "user.message":
+        _add_item(items, record=record, line_number=line_number, role="user", kind="message", content=_text(data.get("content")))
+    elif event_type == "assistant.message":
+        _add_item(items, record=record, line_number=line_number, role="assistant", kind="message", content=_text(data.get("content")))
+        summary = _text(_first(data, "reasoningSummary", "reasoning_summary"))
+        if summary:
+            _add_item(items, record={**record, "id": f"{record.get('id', line_number)}-summary"}, line_number=line_number, role="assistant", kind="reasoning_summary", content=summary)
+        tool_requests = data.get("toolRequests")
+        if isinstance(tool_requests, list):
+            for index, request in enumerate(tool_requests):
+                if not isinstance(request, dict):
+                    continue
+                _add_item(
+                    items,
+                    record={**record, "id": f"{record.get('id', line_number)}-tool-{index}"},
+                    line_number=line_number,
+                    role="assistant",
+                    kind="tool_call",
+                    content="",
+                    metadata=_artifact_metadata(request),
+                )
+    elif event_type in {"tool.execution_start", "tool.execution_complete"}:
+        _add_item(
+            items,
+            record=record,
+            line_number=line_number,
+            role="tool",
+            kind="tool_activity" if event_type == "tool.execution_start" else "tool_result",
+            content="",
+            metadata=_artifact_metadata(data),
+        )
+    return None, None
+
+
 def parse_transcript(provider: str, source_path: str | Path, content: str) -> AgentTranscript | None:
     """Normalize known JSONL transcript shapes without retaining raw reasoning blocks."""
     normalized_provider = provider.casefold().replace("_", "-")
     items: list[TranscriptItem] = []
     thread_id: str | None = None
     cwd: str | None = None
-    parsed_records: list[dict[str, Any]] = []
     for line_number, line in enumerate(content.splitlines(), start=1):
         try:
             record = json.loads(line)
@@ -568,7 +614,6 @@ def parse_transcript(provider: str, source_path: str | Path, content: str) -> Ag
             continue
         if not isinstance(record, dict):
             continue
-        parsed_records.append(record)
         record_id = _first(record, "threadId", "thread_id", "sessionId", "session_id")
         if record_id is not None and thread_id is None:
             thread_id = str(record_id)
@@ -584,11 +629,13 @@ def parse_transcript(provider: str, source_path: str | Path, content: str) -> Ag
         elif normalized_provider in {"copilot", "copilot-cli", "github-copilot"}:
             _generic_record(record, line_number, items)
         elif normalized_provider in {"vscode", "vscode-copilot", "github-copilot-chat"}:
-            _generic_record(record, line_number, items)
+            session_id, session_cwd = _vscode_copilot_record(record, line_number, items)
+            thread_id = session_id or thread_id
+            cwd = session_cwd or cwd
         else:
             return None
 
-    if not parsed_records and not items:
+    if not items:
         return None
     source = Path(source_path)
     if thread_id is None:
