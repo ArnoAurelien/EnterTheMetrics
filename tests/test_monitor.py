@@ -21,6 +21,7 @@ from monitor import (
     main,
     parse_stats,
     _render_table,
+    run_monitor,
 )
 
 
@@ -335,6 +336,48 @@ class StoreTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_monitor_starts_worker_pool_and_closes_client_on_shutdown(self):
+        class FakeContainers:
+            def get(self, name):
+                raise KeyboardInterrupt
+
+        class FakeClient:
+            containers = FakeContainers()
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeLive:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def update(self, *_args, **_kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "containers.json"
+            config_path.write_text(
+                json.dumps({"containers": ["api"], "database": "metrics.sqlite3"}),
+                encoding="utf-8",
+            )
+            client = FakeClient()
+            config = load_config(config_path)
+
+            with patch("monitor.connect_to_docker", return_value=client), patch("rich.live.Live", FakeLive):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_monitor(config)
+
+        self.assertTrue(client.closed)
+
     def test_live_table_has_consistent_state_column_for_stopped_container(self):
         output = io.StringIO()
         table = _render_table(
