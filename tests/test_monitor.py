@@ -1,11 +1,13 @@
 import csv
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from rich.console import Console
 
 from monitor import (
     ConfigError,
@@ -17,6 +19,7 @@ from monitor import (
     load_config,
     main,
     parse_stats,
+    _render_table,
 )
 
 
@@ -92,6 +95,18 @@ class StatsTests(unittest.TestCase):
         self.assertIsNone(sample.network_rx_bytes)
         self.assertIsNone(sample.block_read_bytes)
 
+    def test_parses_container_id_and_docker_started_at(self):
+        sample = parse_stats(
+            "api",
+            {},
+            timestamp=100,
+            container_id="container-123",
+            started_at="1970-01-01T00:01:30.000000000Z",
+        )
+
+        self.assertEqual(sample.container_id, "container-123")
+        self.assertEqual(sample.session_started_at, 90)
+
     def test_derives_cpu_percentage_and_io_rates(self):
         previous = MetricsSample(
             container="api",
@@ -162,8 +177,129 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["network_rx_bytes"], "500")
         self.assertEqual(rows[0]["network_rx_bytes_per_second"], "200.0")
 
+    def test_tracks_session_start_delay_gaps_and_finish_in_csv(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "metrics.sqlite3"
+            with SQLiteStore(database) as store:
+                session_id = store.begin_session(
+                    container_id="container-123",
+                    container="api",
+                    started_at=90,
+                    observed_at=100,
+                    poll_interval_seconds=2,
+                )
+                first = MetricsSample(
+                    container="api",
+                    container_id="container-123",
+                    session_started_at=90,
+                    timestamp=100,
+                    network_rx_bytes=100,
+                )
+                first_metrics = store.save(first, session_id=session_id, poll_interval_seconds=2)
+                second = MetricsSample(
+                    container="api",
+                    container_id="container-123",
+                    session_started_at=90,
+                    timestamp=1000,
+                    network_rx_bytes=1900,
+                )
+                second_metrics = store.save(second, session_id=session_id, poll_interval_seconds=2)
+                store.finish_container_session("container-123", 90, finished_at=1001)
+                output = io.StringIO()
+                count = store.export_csv(output, container="api")
+                session = store.list_sessions(container_id="container-123")[0]
+
+            rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+
+        self.assertIsNone(first_metrics["sample_interval_seconds"])
+        self.assertEqual(second_metrics["sample_interval_seconds"], 900)
+        self.assertTrue(second_metrics["gap_detected"])
+        self.assertEqual(session["status"], "finished")
+        self.assertEqual(session["startup_observation_delay_seconds"], 10)
+        self.assertEqual(count, 2)
+        self.assertEqual(rows[0]["session_started_at_utc"], "1970-01-01T00:01:30Z")
+        self.assertEqual(rows[0]["session_finished_at_utc"], "1970-01-01T00:16:41Z")
+        self.assertEqual(rows[0]["startup_observation_delay_seconds"], "10.0")
+        self.assertEqual(rows[1]["sample_interval_seconds"], "900.0")
+        self.assertEqual(rows[1]["gap_detected"], "1")
+        self.assertEqual(rows[1]["session_status"], "finished")
+
+    def test_new_start_infers_previous_session_finished(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with SQLiteStore(Path(temporary_directory) / "metrics.sqlite3") as store:
+                previous_id = store.begin_session("container-123", "api", 10, 11, 2)
+                current_id = store.begin_session("container-123", "api", 30, 31, 2)
+                sessions = store.list_sessions(container_id="container-123")
+
+        self.assertNotEqual(previous_id, current_id)
+        self.assertEqual(sessions[0]["id"], current_id)
+        self.assertEqual(sessions[0]["status"], "running")
+        self.assertEqual(sessions[1]["id"], previous_id)
+        self.assertEqual(sessions[1]["status"], "finished_inferred")
+        self.assertIsNone(sessions[1]["finished_at"])
+
+    def test_migrates_existing_samples_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "metrics.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE samples (
+                        id INTEGER PRIMARY KEY,
+                        container TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        cpu_total_ns INTEGER,
+                        system_cpu_total INTEGER,
+                        online_cpus INTEGER,
+                        memory_usage_bytes INTEGER,
+                        memory_raw_bytes INTEGER,
+                        memory_limit_bytes INTEGER,
+                        memory_peak_bytes INTEGER,
+                        network_rx_bytes INTEGER,
+                        network_tx_bytes INTEGER,
+                        block_read_bytes INTEGER,
+                        block_write_bytes INTEGER,
+                        cpu_percent REAL,
+                        network_rx_bytes_per_second REAL,
+                        network_tx_bytes_per_second REAL,
+                        block_read_bytes_per_second REAL,
+                        block_write_bytes_per_second REAL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO samples (container, timestamp, network_rx_bytes) VALUES (?, ?, ?)",
+                    ("api", 100, 50),
+                )
+
+            with SQLiteStore(database) as store:
+                row = store.connection.execute("SELECT * FROM samples").fetchone()
+                columns = {column["name"] for column in store.connection.execute("PRAGMA table_info(samples)")}
+
+        self.assertEqual(row["network_rx_bytes"], 50)
+        self.assertIsNone(row["session_id"])
+        self.assertTrue({"session_id", "sample_interval_seconds", "gap_detected"}.issubset(columns))
+
 
 class CLITests(unittest.TestCase):
+    def test_live_table_has_consistent_state_column_for_stopped_container(self):
+        output = io.StringIO()
+        table = _render_table(
+            [
+                {
+                    "container": "api",
+                    "sample": None,
+                    "started_at": 10,
+                    "sampled_at": 20,
+                    "status": "exited: no current sample",
+                }
+            ]
+        )
+        Console(file=output, width=180).print(table)
+
+        self.assertIn("State", output.getvalue())
+        self.assertIn("exited:", output.getvalue())
+
     def test_export_works_with_empty_container_list(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             config_path = Path(temporary_directory) / "containers.json"
