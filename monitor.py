@@ -26,6 +26,7 @@ class MonitorConfig:
     containers: tuple[str, ...]
     poll_interval_seconds: float
     database_path: Path
+    config_path: Path
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ def load_config(path: str | Path, require_containers: bool = True) -> MonitorCon
     if not database_path.is_absolute():
         database_path = config_path.parent / database_path
 
-    return MonitorConfig(normalized_containers, interval, database_path.resolve())
+    return MonitorConfig(normalized_containers, interval, database_path.resolve(), config_path)
 
 
 def _integer(value: Any) -> int | None:
@@ -683,70 +684,85 @@ def run_monitor(config: MonitorConfig, interval: float | None = None) -> None:
     client = connect_to_docker()
     console = Console()
     try:
-        with SQLiteStore(config.database_path) as store, Live(
-            _render_table([]), console=console, refresh_per_second=4
-        ) as live:
-            while True:
-                poll_started = time.monotonic()
-                rows = []
-                for name in config.containers:
+        with Live(_render_table([]), console=console, refresh_per_second=4) as live:
+            store = SQLiteStore(config.database_path)
+            active_database_path = config.database_path
+            try:
+                while True:
+                    poll_started = time.monotonic()
                     try:
-                        container = client.containers.get(name)
-                        container.reload()
-                        attributes = container.attrs
-                        state = attributes.get("State", {})
-                        status = state.get("Status", "unknown")
-                        container_id = attributes.get("Id")
-                        started_at_text = state.get("StartedAt")
-                        started_at = parse_docker_timestamp(started_at_text)
-                        if not container_id or started_at is None:
-                            raise ValueError("Docker did not provide a valid container ID and StartedAt timestamp.")
-                        if status != "running":
-                            store.finish_container_session(
-                                container_id,
-                                started_at,
-                                parse_docker_timestamp(state.get("FinishedAt")),
+                        current_config = load_config(config.config_path, require_containers=False)
+                    except ConfigError as error:
+                        current_config = None
+                        current_poll_interval = poll_interval
+                        rows = [{"container": "Configuration", "error": str(error), "sample": None}]
+                    else:
+                        current_poll_interval = interval or current_config.poll_interval_seconds
+                        if current_config.database_path != active_database_path:
+                            store.close()
+                            store = SQLiteStore(current_config.database_path)
+                            active_database_path = current_config.database_path
+                        rows = []
+                    for name in current_config.containers if current_config is not None else ():
+                        try:
+                            container = client.containers.get(name)
+                            container.reload()
+                            attributes = container.attrs
+                            state = attributes.get("State", {})
+                            status = state.get("Status", "unknown")
+                            container_id = attributes.get("Id")
+                            started_at_text = state.get("StartedAt")
+                            started_at = parse_docker_timestamp(started_at_text)
+                            if not container_id or started_at is None:
+                                raise ValueError("Docker did not provide a valid container ID and StartedAt timestamp.")
+                            if status != "running":
+                                store.finish_container_session(
+                                    container_id,
+                                    started_at,
+                                    parse_docker_timestamp(state.get("FinishedAt")),
+                                )
+                                rows.append(
+                                    {
+                                        "container": name,
+                                        "started_at": started_at,
+                                        "sampled_at": time.time(),
+                                        "status": f"{status}: no current sample",
+                                        "sample": None,
+                                    }
+                                )
+                                continue
+                            stats = container.stats(stream=False)
+                            sample = parse_stats(
+                                name,
+                                stats,
+                                container_id=container_id,
+                                started_at=started_at_text,
                             )
+                            session_id = store.begin_session(
+                                container_id,
+                                name,
+                                started_at,
+                                sample.timestamp,
+                                current_poll_interval,
+                            )
+                            derived = store.save(sample, session_id, current_poll_interval)
                             rows.append(
                                 {
                                     "container": name,
-                                    "started_at": started_at,
-                                    "sampled_at": time.time(),
-                                    "status": f"{status}: no current sample",
-                                    "sample": None,
+                                    "sample": sample,
+                                    "derived": derived,
+                                    "session": store.get_session(session_id),
+                                    "poll_interval_seconds": current_poll_interval,
                                 }
                             )
-                            continue
-                        stats = container.stats(stream=False)
-                        sample = parse_stats(
-                            name,
-                            stats,
-                            container_id=container_id,
-                            started_at=started_at_text,
-                        )
-                        session_id = store.begin_session(
-                            container_id,
-                            name,
-                            started_at,
-                            sample.timestamp,
-                            poll_interval,
-                        )
-                        derived = store.save(sample, session_id, poll_interval)
-                        rows.append(
-                            {
-                                "container": name,
-                                "sample": sample,
-                                "derived": derived,
-                                "session": store.get_session(session_id),
-                                "poll_interval_seconds": poll_interval,
-                            }
-                        )
-                    except Exception as error:
-                        rows.append({"container": name, "error": str(error), "sample": None})
-                live.update(_render_table(rows), refresh=True)
-                delay = poll_interval - (time.monotonic() - poll_started)
-                if delay > 0:
-                    time.sleep(delay)
+                        except Exception as error:
+                            rows.append({"container": name, "error": str(error), "sample": None})
+                    live.update(_render_table(rows), refresh=True)
+                    delay = current_poll_interval - (time.monotonic() - poll_started)
+                    if delay > 0:
+                        time.sleep(delay)
+            finally:
+                store.close()
     finally:
         client.close()
 
