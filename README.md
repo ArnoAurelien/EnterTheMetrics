@@ -4,11 +4,10 @@ This Python CLI polls Docker Engine for resource statistics for the containers l
 
 ## Setup
 
-Use Python 3.10 or newer. In the devcontainer, `.venv` is created and dependencies are installed automatically. Activate it in a terminal:
+Use Python 3.10 or newer. In the devcontainer, `.venv` is created and dependencies are installed automatically. If you need to install them manually, use the virtual environment's interpreter directly:
 
 ```sh
-. .venv/bin/activate
-python -m pip install -r requirements.txt
+.venv/bin/python3 -m pip install -r requirements.txt
 ```
 
 Edit `containers.json` and add the names or IDs of the containers to monitor:
@@ -32,24 +31,30 @@ The Docker Python SDK uses the Docker environment variables `DOCKER_HOST`, `DOCK
 Start live monitoring with the default config and interval:
 
 ```sh
-python monitor.py
+.venv/bin/python3 monitor.py
 ```
 
 Use a different config or polling interval like this:
 
 ```sh
-python monitor.py --config containers.json --interval 5
+.venv/bin/python3 monitor.py --config containers.json --interval 5
 ```
 
-The table reports CPU percentage, working-set memory and limit, memory percentage, network transfer rates and cumulative bytes, and block I/O rates and cumulative bytes. CPU percentage can exceed 100% when a container uses multiple cores. The first sample has no rate because there is no prior counter to compare with. Docker may omit some metrics depending on the container/runtime; those values appear as `n/a`.
+Each work session is identified by Docker's immutable container ID and `StartedAt` timestamp, not its creation time or configured name. The monitor records the first observation delay, each sample timestamp and interval, and flags intervals longer than 1.5 times the polling interval. The live table includes session start, sample time, interval, gap, and container state.
+
+CPU usage, network bytes, and block I/O counters are stored as Docker reports them, together with derived CPU percentages and transfer rates. These counters can show totals already accumulated before monitoring began, while memory is only known at observed sample times. Per-session totals can use the final cumulative counter for each session; all-time totals can sum those session totals. No points are invented for an unmonitored interval, so rates over a flagged gap are averages and memory history has a gap. Docker may omit some metrics depending on the container/runtime; those values appear as `n/a`.
+
+Sessions are marked finished when Docker reports a stop time. If monitoring was off during a restart, the previous session is marked `finished_inferred` with no fabricated finish time. If a container disappears, its last session remains identifiable by its last sample time rather than being falsely marked finished. A session that was never observed is not added to the database.
+
+The SQLite database has a `sessions` table for container lifecycle metadata and a `samples` table linked by session ID. Existing sample rows are preserved during migration but remain unassigned to sessions because their original container IDs and start times were not recorded.
 
 ## Export History
 
 Export all stored samples, or filter by container and time window:
 
 ```sh
-python monitor.py export --output history.csv
-python monitor.py export --container api --since-hours 24 --output api-last-day.csv
+.venv/bin/python3 monitor.py export --output history.csv
+.venv/bin/python3 monitor.py export --container api --since-hours 24 --output api-last-day.csv
 ```
 
-Without `--output`, CSV is written to standard output. The CSV includes UTC timestamps, raw counters, memory measurements, CPU percentage, and derived transfer rates.
+Without `--output`, CSV is written to standard output. The CSV includes UTC sample, session-start, and known session-finish times; session status and startup-observation delay; interval and gap fields; raw counters; memory measurements; CPU percentage; and derived transfer rates. `sessions` records can also be queried directly from SQLite by a future dashboard; no UI is included here.
